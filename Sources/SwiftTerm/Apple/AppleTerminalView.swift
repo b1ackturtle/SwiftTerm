@@ -1683,6 +1683,11 @@ extension TerminalView {
         #endif
         caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
         caretView.setText (ch: buffer.lines [vy][buffer.x])
+        #if os(macOS)
+        if caretView.isHidden && !hasMarkedText() {
+            caretView.isHidden = false
+        }
+        #endif
     }
     
     // Does not use a default argument and merge, because it is called back

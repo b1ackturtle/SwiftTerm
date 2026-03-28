@@ -660,8 +660,54 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         }
         drawTerminalContents (dirtyRect: dirtyRect, context: currentContext, bufferOffset: terminal.displayBuffer.yDisp)
+        drawCompositionText(context: currentContext)
     }
-    
+
+    private func drawCompositionText(context: CGContext) {
+        guard _markedText.length > 0 else { return }
+
+        context.saveGState()
+
+        let buffer = terminal.displayBuffer
+        let lineOffset = cellDimension.height * CGFloat(buffer.y - (buffer.yDisp - buffer.yBase) + 1)
+        let lineOriginY = frame.height - lineOffset
+        let cursorX = cellDimension.width * CGFloat(buffer.x)
+        let yOffset = ceil(CTFontGetDescent(fontSet.normal) + CTFontGetLeading(fontSet.normal))
+
+        let attrs: [NSAttributedString.Key: Any] = [.font: fontSet.normal, .foregroundColor: nativeForegroundColor]
+        let chars = Array(_markedText.string)
+        let widths = chars.map { max(1, $0.unicodeScalars.reduce(0) { $0 + UnicodeUtil.columnWidth(rune: $1) }) }
+        let textWidth = cellDimension.width * CGFloat(widths.reduce(0, +))
+
+        context.setFillColor(nativeBackgroundColor.cgColor)
+        context.fill(CGRect(x: cursorX, y: lineOriginY, width: textWidth, height: cellDimension.height))
+
+        var col = 0
+        for (char, w) in zip(chars, widths) {
+            let x = cursorX + CGFloat(col) * cellDimension.width
+            let ctLine = CTLineCreateWithAttributedString(NSAttributedString(string: String(char), attributes: attrs))
+            context.textPosition = CGPoint(x: x, y: lineOriginY + yOffset)
+            CTLineDraw(ctLine, context)
+            col += w
+        }
+
+        let scale = backingScaleFactor()
+        let underlineY = lineOriginY + yOffset + fontSet.underlinePosition()
+        let lineWidth = max(round(scale * fontSet.underlineThickness()) / scale, 0.5)
+        context.setStrokeColor(nativeForegroundColor.cgColor)
+        context.setLineWidth(lineWidth)
+        context.setShouldAntialias(false)
+        context.move(to: CGPoint(x: cursorX, y: underlineY))
+        context.addLine(to: CGPoint(x: cursorX + textWidth, y: underlineY))
+        context.strokePath()
+
+        let cursorBarWidth: CGFloat = 2
+        context.setFillColor(nativeForegroundColor.cgColor)
+        context.fill(CGRect(x: cursorX + textWidth, y: lineOriginY, width: cursorBarWidth, height: cellDimension.height))
+
+        context.restoreGState()
+    }
+
     public override func cursorUpdate(with event: NSEvent)
     {
         NSCursor.iBeam.set ()
@@ -893,7 +939,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
 
     private var pendingKittyKeyEvent: PendingKittyKeyEvent?
-    private var kittyIsComposing = false
+    private var kittyIsComposing: Bool { _markedText.length > 0 }
+    private var _markedText = NSMutableAttributedString()
     
     //
     // We capture a handful of keydown events and pre-process those, and then let
@@ -1171,9 +1218,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func insertText(_ string: Any, replacementRange: NSRange) {
+        _markedText.mutableString.setString("")
         insertText(string, replacementRange: replacementRange, isPaste: false)
     }
-    
+
     func insertText(_ string: Any, replacementRange: NSRange, isPaste: Bool) {
         if let str = string as? NSString {
             if !terminal.keyboardEnhancementFlags.isEmpty {
@@ -1186,7 +1234,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 }
                 let pendingEvent = pendingKittyKeyEvent
                 pendingKittyKeyEvent = nil
-                kittyIsComposing = false
                 let text = str as String
                 let kittyEvent: KittyKeyEvent
                 if text.unicodeScalars.count == 1,
@@ -1213,7 +1260,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        kittyIsComposing = true
+        switch string {
+        case let v as NSAttributedString:
+            _markedText.setAttributedString(v)
+        case let v as String:
+            _markedText.mutableString.setString(v)
+        default:
+            _markedText.mutableString.setString("")
+        }
+
+        caretView?.isHidden = _markedText.length > 0
+        needsDisplay = true
     }
 
     private func kittyEncoder() -> KittyKeyboardEncoder {
@@ -1587,7 +1644,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func unmarkText() {
-        kittyIsComposing = false
+        guard _markedText.length > 0 else { return }
+        _markedText.mutableString.setString("")
+        caretView?.isHidden = false
+        needsDisplay = true
     }
     
     // NSTextInputClient protocol implementation
@@ -1612,17 +1672,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func markedRange() -> NSRange {
-        print ("markedRange: This should return the actual range from the selection")
-        
-        // This means "no marked" - when we fix, we should address
-        return NSRange.empty
+        guard _markedText.length > 0 else { return NSRange.empty }
+        return NSRange(location: 0, length: _markedText.length)
     }
-    
+
     // NSTextInputClient protocol implementation
     open func hasMarkedText() -> Bool {
-        // print ("hasMarkedText: This should return the actual range from the selection")
-        // TODO
-        return false
+        _markedText.length > 0
     }
     
     // NSTextInputClient protocol implementation
