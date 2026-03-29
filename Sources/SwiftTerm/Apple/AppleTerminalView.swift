@@ -1684,8 +1684,17 @@ extension TerminalView {
         caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
         caretView.setText (ch: buffer.lines [vy][buffer.x])
         #if os(macOS)
-        if caretView.isHidden && !hasMarkedText() {
-            caretView.isHidden = false
+        if !hasMarkedText() {
+            if caretView.isHidden {
+                caretView.isHidden = false
+            }
+#if canImport(MetalKit)
+            if suppressMetalCursorForComposition {
+                suppressMetalCursorForComposition = false
+                hideCompositionOverlay()
+                requestMetalDisplay()
+            }
+#endif
         }
         #endif
     }

@@ -16,6 +16,34 @@ import CoreGraphics
 import Carbon.HIToolbox
 #if canImport(MetalKit)
 import MetalKit
+
+/// Transparent overlay view used to draw IME composition text above the Metal view.
+private class CompositionOverlayView: NSView {
+    weak var terminal: TerminalView?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func makeBackingLayer() -> CALayer {
+        let layer = super.makeBackingLayer()
+        layer.isOpaque = false
+        layer.backgroundColor = NSColor.clear.cgColor
+        return layer
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+        terminal?.drawCompositionText(context: ctx)
+    }
+}
 #endif
 
 /**
@@ -121,6 +149,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var useMetalRenderer = false
     var metalDirtyRange: ClosedRange<Int>?
     var pendingMetalDisplay: Bool = false
+    private var compositionOverlay: CompositionOverlayView?
+    var suppressMetalCursorForComposition = false
     /// Controls how the Metal renderer builds GPU buffers each frame.
     ///
     /// The default is ``MetalBufferingMode/perRowPersistent``, which caches
@@ -282,9 +312,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             }
             metalView = mtkView
             metalRenderer = renderer
+            let overlay = CompositionOverlayView(frame: bounds)
+            overlay.autoresizingMask = [.width, .height]
+            overlay.terminal = self
+            overlay.isHidden = true
+            addSubview(overlay, positioned: .above, relativeTo: mtkView)
+            compositionOverlay = overlay
             needsDisplay = false
             mtkView.setNeedsDisplay(mtkView.bounds)
         } else {
+            compositionOverlay?.removeFromSuperview()
+            compositionOverlay = nil
             metalView?.removeFromSuperview()
             metalView = nil
             metalRenderer = nil
@@ -295,8 +333,12 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             needsDisplay = true
         }
     }
+
+    func hideCompositionOverlay() {
+        compositionOverlay?.isHidden = true
+    }
 #endif
-    
+
     func startDisplayUpdates ()
     {
         // Not used on Mac
@@ -663,7 +705,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         drawCompositionText(context: currentContext)
     }
 
-    private func drawCompositionText(context: CGContext) {
+    fileprivate func drawCompositionText(context: CGContext) {
         guard _markedText.length > 0 else { return }
 
         context.saveGState()
@@ -1269,8 +1311,22 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             _markedText.mutableString.setString("")
         }
 
-        caretView?.isHidden = _markedText.length > 0
+        let hasText = _markedText.length > 0
+        caretView?.isHidden = hasText
+#if canImport(MetalKit)
+        if metalView != nil {
+            suppressMetalCursorForComposition = hasText
+            compositionOverlay?.isHidden = !hasText
+            if hasText {
+                compositionOverlay?.needsDisplay = true
+            }
+            requestMetalDisplay()
+        } else {
+            needsDisplay = true
+        }
+#else
         needsDisplay = true
+#endif
     }
 
     private func kittyEncoder() -> KittyKeyboardEncoder {
@@ -1647,6 +1703,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         guard _markedText.length > 0 else { return }
         _markedText.mutableString.setString("")
         caretView?.isHidden = false
+#if canImport(MetalKit)
+        compositionOverlay?.isHidden = true
+#endif
         needsDisplay = true
     }
     

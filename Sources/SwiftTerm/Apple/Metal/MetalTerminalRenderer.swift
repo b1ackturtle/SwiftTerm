@@ -1134,27 +1134,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let runFont = runAttributes[.font] as? TTFont ?? terminalView.fontSet.normal
                 let ctFont = runFont as CTFont
                 let startColumn = shaped.segment.column + (processedGlyphs * shaped.segment.columnWidth)
-                let baseX = lineOrigin.x + (cellWidth * CGFloat(startColumn))
-                let xOffset = baseX - run.shaperRun.firstX
 
                 let textColor = runAttributes[.foregroundColor] as? TTColor ?? terminalView.nativeForegroundColor
                 let textColorSIMD = colorToSIMD(textColor)
 
+                var glyphIndex = 0
                 for glyphRun in run.shaperRun.glyphRuns {
                     let scaledFont = scaledFontFor(font: glyphRun.font, scale: scale)
                     for i in 0..<glyphRun.glyphs.count {
                         let glyph = glyphRun.glyphs[i]
                         guard let entry = glyphEntry(for: scaledFont, glyph: glyph) else {
+                            glyphIndex += 1
                             continue
                         }
                         if entry.size.width <= 0 || entry.size.height <= 0 {
+                            glyphIndex += 1
                             continue
                         }
+                        let glyphColumn = startColumn + (glyphIndex * shaped.segment.columnWidth)
+                        let cellAlignedX = lineOrigin.x + CGFloat(glyphColumn) * cellWidth
                         let ctPos = glyphRun.positions[i]
-                        let basePos = CGPoint(x: ctPos.x + xOffset,
-                                              y: lineOrigin.y + yOffset + ctPos.y)
-                        let pxX = basePos.x * scale + entry.bearing.x
-                        let pxY = basePos.y * scale + entry.bearing.y
+                        let pxX = cellAlignedX * scale + entry.bearing.x
+                        let pxY = (lineOrigin.y + yOffset + ctPos.y) * scale + entry.bearing.y
 
                         let x0 = pxX
                         let y0 = pxY
@@ -1186,6 +1187,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                 glyphCellsColor.append(cell)
                             }
                         }
+                        glyphIndex += 1
                     }
                 }
 
@@ -1197,12 +1199,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let thickness = underlineThickness * scale
                     let segmentStyle: UnderlineStyle = underlineStyle == .double ? .single : underlineStyle
 
-                    for ctPos in run.shaperRun.positions {
-                        let basePos = CGPoint(x: ctPos.x + xOffset,
-                                              y: lineOrigin.y + yOffset + ctPos.y)
-                        let x0 = basePos.x * scale
-                        let x1 = (basePos.x + decorationCellWidth) * scale
-                        let yCenter = (basePos.y + underlinePosition) * scale
+                    for (idx, ctPos) in run.shaperRun.positions.enumerated() {
+                        let glyphColumn = startColumn + (idx * shaped.segment.columnWidth)
+                        let cellAlignedX = lineOrigin.x + CGFloat(glyphColumn) * cellWidth
+                        let basePosY = lineOrigin.y + yOffset + ctPos.y
+                        let x0 = cellAlignedX * scale
+                        let x1 = (cellAlignedX + decorationCellWidth) * scale
+                        let yCenter = (basePosY + underlinePosition) * scale
                         appendUnderlineSegments(x0: x0,
                                                 x1: x1,
                                                 yCenter: yCenter,
@@ -1215,7 +1218,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                                 pivotY: pivotY,
                                                 output: &decorationCells)
                         if underlineStyle == .double {
-                            let yDouble = (basePos.y + underlinePosition - underlineThickness - 1) * scale
+                            let yDouble = (basePosY + underlinePosition - underlineThickness - 1) * scale
                             appendUnderlineSegments(x0: x0,
                                                     x1: x1,
                                                     yCenter: yDouble,
@@ -1248,12 +1251,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let strikeThickness = max(round(scale * CTFontGetUnderlineThickness(ctFont)) / scale, 0.5)
                     let strikePosition = (CTFontGetXHeight(ctFont) + strikeThickness) * 0.5
 
-                    for ctPos in run.shaperRun.positions {
-                        let basePos = CGPoint(x: ctPos.x + xOffset,
-                                              y: lineOrigin.y + yOffset + ctPos.y)
-                        let x0 = basePos.x * scale
-                        let x1 = (basePos.x + decorationCellWidth) * scale
-                        let yCenter = (basePos.y + strikePosition) * scale
+                    for (idx, ctPos) in run.shaperRun.positions.enumerated() {
+                        let glyphColumn = startColumn + (idx * shaped.segment.columnWidth)
+                        let cellAlignedX = lineOrigin.x + CGFloat(glyphColumn) * cellWidth
+                        let basePosY = lineOrigin.y + yOffset + ctPos.y
+                        let x0 = cellAlignedX * scale
+                        let x1 = (cellAlignedX + decorationCellWidth) * scale
+                        let yCenter = (basePosY + strikePosition) * scale
                         let thickness = strikeThickness * scale
                         appendUnderlineSegments(x0: x0,
                                                 x1: x1,
@@ -1267,7 +1271,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                                 pivotY: pivotY,
                                                 output: &decorationCells)
                         if isDouble {
-                            let yDouble = (basePos.y + strikePosition - strikeThickness - 1) * scale
+                            let yDouble = (basePosY + strikePosition - strikeThickness - 1) * scale
                             appendUnderlineSegments(x0: x0,
                                                     x1: x1,
                                                     yCenter: yDouble,
@@ -2048,7 +2052,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return ([], [], [])
         }
         let buffer = terminalView.terminal.displayBuffer
-        if terminalView.terminal.cursorHidden {
+        if terminalView.terminal.cursorHidden || terminalView.suppressMetalCursorForComposition {
             return ([], [], [])
         }
         let cursorRow = buffer.yBase + buffer.y
