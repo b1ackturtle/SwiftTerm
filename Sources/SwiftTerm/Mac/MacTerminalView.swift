@@ -719,11 +719,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let attrs: [NSAttributedString.Key: Any] = [.font: fontSet.normal, .foregroundColor: nativeForegroundColor]
         let chars = Array(_markedText.string)
         let widths = chars.map { max(1, $0.unicodeScalars.reduce(0) { $0 + UnicodeUtil.columnWidth(rune: $1) }) }
-        let textWidth = cellDimension.width * CGFloat(widths.reduce(0, +))
+        let compositionCols = widths.reduce(0, +)
+        let textWidth = cellDimension.width * CGFloat(compositionCols)
 
+        // Fill background from cursor to end of line to cover both composition and shifted existing text
+        let lineEndX = cellDimension.width * CGFloat(buffer.cols)
         context.setFillColor(nativeBackgroundColor.cgColor)
-        context.fill(CGRect(x: cursorX, y: lineOriginY, width: textWidth, height: cellDimension.height))
+        context.fill(CGRect(x: cursorX, y: lineOriginY, width: lineEndX - cursorX, height: cellDimension.height))
 
+        // Draw composition text
         var col = 0
         for (char, w) in zip(chars, widths) {
             let x = cursorX + CGFloat(col) * cellDimension.width
@@ -733,6 +737,45 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             col += w
         }
 
+        // Redraw existing buffer text shifted right by the composition text width
+        let row = buffer.yBase + buffer.y
+        if row >= 0 && row < buffer.lines.count {
+            let line = buffer.lines[row]
+            var bufCol = buffer.x
+            while bufCol < buffer.cols {
+                let charData = line[bufCol]
+                let cellWidth = Int(charData.width)
+                if cellWidth <= 0 {
+                    bufCol += 1
+                    continue
+                }
+                let shiftedCol = bufCol - buffer.x + compositionCols + buffer.x
+                if shiftedCol >= buffer.cols { break }
+
+                let ch = terminal.getCharacter(for: charData)
+                if ch != "\0" && ch != " " || charData.attribute.bg != .defaultColor {
+                    if charData.attribute.bg != .defaultColor {
+                        let bgColor = mapColor(color: charData.attribute.bg, isFg: false, isBold: false)
+                        context.setFillColor(bgColor.cgColor)
+                        context.fill(CGRect(
+                            x: CGFloat(shiftedCol) * cellDimension.width,
+                            y: lineOriginY,
+                            width: CGFloat(cellWidth) * cellDimension.width,
+                            height: cellDimension.height))
+                    }
+                    let fgColor = mapColor(color: charData.attribute.fg, isFg: true,
+                                           isBold: charData.attribute.style.contains(.bold))
+                    let cellAttrs: [NSAttributedString.Key: Any] = [.font: fontSet.normal, .foregroundColor: fgColor]
+                    let x = CGFloat(shiftedCol) * cellDimension.width
+                    let ctLine = CTLineCreateWithAttributedString(NSAttributedString(string: String(ch), attributes: cellAttrs))
+                    context.textPosition = CGPoint(x: x, y: lineOriginY + yOffset)
+                    CTLineDraw(ctLine, context)
+                }
+                bufCol += cellWidth
+            }
+        }
+
+        // Draw underline beneath composition text
         let scale = backingScaleFactor()
         let underlineY = lineOriginY + yOffset + fontSet.underlinePosition()
         let lineWidth = max(round(scale * fontSet.underlineThickness()) / scale, 0.5)
@@ -743,6 +786,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         context.addLine(to: CGPoint(x: cursorX + textWidth, y: underlineY))
         context.strokePath()
 
+        // Draw cursor bar at the end of composition text
         let cursorBarWidth: CGFloat = 2
         context.setFillColor(nativeForegroundColor.cgColor)
         context.fill(CGRect(x: cursorX + textWidth, y: lineOriginY, width: cursorBarWidth, height: cellDimension.height))
@@ -1312,7 +1356,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         let hasText = _markedText.length > 0
+#if canImport(MetalKit)
+        if metalView == nil {
+            caretView?.isHidden = hasText
+        }
+#else
         caretView?.isHidden = hasText
+#endif
 #if canImport(MetalKit)
         if metalView != nil {
             suppressMetalCursorForComposition = hasText
@@ -1702,9 +1752,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     open func unmarkText() {
         guard _markedText.length > 0 else { return }
         _markedText.mutableString.setString("")
-        caretView?.isHidden = false
 #if canImport(MetalKit)
+        if metalView == nil {
+            caretView?.isHidden = false
+        }
         compositionOverlay?.isHidden = true
+#else
+        caretView?.isHidden = false
 #endif
         needsDisplay = true
     }

@@ -1685,14 +1685,19 @@ extension TerminalView {
         caretView.setText (ch: buffer.lines [vy][buffer.x])
         #if os(macOS)
         if !hasMarkedText() {
-            if caretView.isHidden {
+#if canImport(MetalKit)
+            if metalView != nil {
+                if suppressMetalCursorForComposition {
+                    suppressMetalCursorForComposition = false
+                    hideCompositionOverlay()
+                }
+                requestMetalDisplay()
+            } else if caretView.isHidden {
                 caretView.isHidden = false
             }
-#if canImport(MetalKit)
-            if suppressMetalCursorForComposition {
-                suppressMetalCursorForComposition = false
-                hideCompositionOverlay()
-                requestMetalDisplay()
+#else
+            if caretView.isHidden {
+                caretView.isHidden = false
             }
 #endif
         }
