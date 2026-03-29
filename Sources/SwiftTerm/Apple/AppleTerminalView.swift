@@ -1690,10 +1690,7 @@ extension TerminalView {
         if !hasMarkedText() {
 #if canImport(MetalKit)
             if metalView != nil {
-                if suppressMetalCursorForComposition {
-                    suppressMetalCursorForComposition = false
-                    hideCompositionOverlay()
-                }
+                hideCompositionOverlay()
                 requestMetalDisplay()
             } else if caretView.isHidden {
                 caretView.isHidden = false

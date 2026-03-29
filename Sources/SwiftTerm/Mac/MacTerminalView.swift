@@ -150,7 +150,6 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var metalDirtyRange: ClosedRange<Int>?
     var pendingMetalDisplay: Bool = false
     private var compositionOverlay: CompositionOverlayView?
-    var suppressMetalCursorForComposition = false
     /// Controls how the Metal renderer builds GPU buffers each frame.
     ///
     /// The default is ``MetalBufferingMode/perRowPersistent``, which caches
@@ -1357,24 +1356,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
         let hasText = _markedText.length > 0
 #if canImport(MetalKit)
-        if metalView == nil {
-            caretView?.isHidden = hasText
-        }
-#else
-        caretView?.isHidden = hasText
-#endif
-#if canImport(MetalKit)
         if metalView != nil {
-            suppressMetalCursorForComposition = hasText
             compositionOverlay?.isHidden = !hasText
             if hasText {
                 compositionOverlay?.needsDisplay = true
             }
             requestMetalDisplay()
         } else {
+            caretView?.isHidden = hasText
             needsDisplay = true
         }
 #else
+        caretView?.isHidden = hasText
         needsDisplay = true
 #endif
     }
@@ -1753,14 +1746,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         guard _markedText.length > 0 else { return }
         _markedText.mutableString.setString("")
 #if canImport(MetalKit)
-        if metalView == nil {
+        if metalView != nil {
+            compositionOverlay?.isHidden = true
+            requestMetalDisplay()
+        } else {
             caretView?.isHidden = false
+            needsDisplay = true
         }
-        compositionOverlay?.isHidden = true
 #else
         caretView?.isHidden = false
-#endif
         needsDisplay = true
+#endif
     }
     
     // NSTextInputClient protocol implementation

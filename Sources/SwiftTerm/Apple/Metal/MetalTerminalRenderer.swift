@@ -2052,7 +2052,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return ([], [], [])
         }
         let buffer = terminalView.terminal.displayBuffer
-        if terminalView.terminal.cursorHidden || terminalView.suppressMetalCursorForComposition {
+        if terminalView.terminal.cursorHidden || terminalView.hasMarkedText() {
             return ([], [], [])
         }
         let cursorRow = buffer.yBase + buffer.y
