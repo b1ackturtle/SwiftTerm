@@ -1681,8 +1681,11 @@ extension TerminalView {
         let offset = (cellDimension.height * (CGFloat(buffer.y-(buffer.yDisp-buffer.yBase)+1)))
         let lineOrigin = CGPoint(x: 0, y: frame.height - offset)
         #endif
+        let ch = buffer.lines [vy][buffer.x]
+        let charWidth = CGFloat(max(1, Int(ch.width)))
+        caretView.frame.size.width = cellDimension.width * charWidth
         caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
-        caretView.setText (ch: buffer.lines [vy][buffer.x])
+        caretView.setText (ch: ch)
         #if os(macOS)
         if !hasMarkedText() {
 #if canImport(MetalKit)

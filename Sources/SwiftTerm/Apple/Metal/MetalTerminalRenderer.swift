@@ -2073,9 +2073,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let cellHeightPx = cellHeight * scale
         let doublePosition: CGFloat = buffer.lines[cursorRow].renderMode == .single ? 1.0 : 2.0
 
+        let cursorCharData = buffer.lines[cursorRow][buffer.x]
+        let cursorCharWidth = CGFloat(max(1, Int(cursorCharData.width)))
         let x0 = lineOriginPx.x + CGFloat(buffer.x) * cellWidthPx * doublePosition
         let y0 = lineOriginPx.y
-        let x1 = x0 + cellWidthPx
+        let x1 = x0 + cellWidthPx * cursorCharWidth
         let y1 = y0 + cellHeightPx
 
         #if os(macOS)
