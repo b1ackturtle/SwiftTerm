@@ -439,6 +439,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
 
     /// This controls whether the backspace should send ^? or ^H, the default is ^?
     public var backspaceSendsControlH: Bool = false
+    var textInputState = MacTextInputState()
     
     var _nativeFg, _nativeBg: TTColor!
     var settingFg = false, settingBg = false
@@ -710,14 +711,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         context.saveGState()
 
         let buffer = terminal.displayBuffer
+        let row = buffer.yBase + buffer.y
+        let line = (row >= 0 && row < buffer.lines.count) ? buffer.lines[row] : nil
+        let anchorCol = line.flatMap { terminal.resolvedCursorCell(in: $0, at: buffer.x)?.col } ?? buffer.x
         let lineOffset = cellDimension.height * CGFloat(buffer.y - (buffer.yDisp - buffer.yBase) + 1)
         let lineOriginY = frame.height - lineOffset
-        let cursorX = cellDimension.width * CGFloat(buffer.x)
+        let cursorX = cellDimension.width * CGFloat(anchorCol)
         let yOffset = ceil(CTFontGetDescent(fontSet.normal) + CTFontGetLeading(fontSet.normal))
 
         let attrs: [NSAttributedString.Key: Any] = [.font: fontSet.normal, .foregroundColor: nativeForegroundColor]
         let chars = Array(_markedText.string)
-        let widths = chars.map { max(1, $0.unicodeScalars.reduce(0) { $0 + UnicodeUtil.columnWidth(rune: $1) }) }
+        let widths = chars.map { max(1, UnicodeUtil.columnWidth(character: $0)) }
         let compositionCols = widths.reduce(0, +)
         let textWidth = cellDimension.width * CGFloat(compositionCols)
 
@@ -737,10 +741,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
 
         // Redraw existing buffer text shifted right by the composition text width
-        let row = buffer.yBase + buffer.y
-        if row >= 0 && row < buffer.lines.count {
-            let line = buffer.lines[row]
-            var bufCol = buffer.x
+        if let line {
+            var bufCol = anchorCol
             while bufCol < buffer.cols {
                 let charData = line[bufCol]
                 let cellWidth = Int(charData.width)
@@ -748,7 +750,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                     bufCol += 1
                     continue
                 }
-                let shiftedCol = bufCol - buffer.x + compositionCols + buffer.x
+                let shiftedCol = bufCol - anchorCol + compositionCols + anchorCol
                 if shiftedCol >= buffer.cols { break }
 
                 let ch = terminal.getCharacter(for: charData)
@@ -860,6 +862,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public override func resignFirstResponder() -> Bool {
         let response = super.resignFirstResponder()
         if response {
+            resetTextInputState()
             caretView.disableAnimations()
             hasFocus = false
             terminal.setTerminalFocus(false)
@@ -1023,7 +1026,13 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let eventType: KittyKeyboardEventType
     }
 
+    enum DeleteForwardCommandKind: Equatable {
+        case eof
+        case forwardDelete
+    }
+
     private var pendingKittyKeyEvent: PendingKittyKeyEvent?
+    private var pendingInterpretedKeyEvent: NSEvent?
     private var kittyIsComposing: Bool { _markedText.length > 0 }
     private var _markedText = NSMutableAttributedString()
     
@@ -1075,7 +1084,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             }
 
             pendingKittyKeyEvent = PendingKittyKeyEvent(event: event, eventType: textEventType)
-            interpretKeyEvents([event])
+            interpretPendingKeyEvent(event)
             return
         }
         
@@ -1085,6 +1094,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 optionAsMetaKey.toggle()
             }
         } else if optionAsMetaKey && eventFlags.contains (.option) {
+            resetTextInputState()
             if let rawCharacter = event.charactersIgnoringModifiers {
                 if let fs = rawCharacter.unicodeScalars.first {
                     switch Int (fs.value) {
@@ -1103,6 +1113,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             return
         } else if eventFlags.contains (.control) {
             // Sends the control sequence
+            resetTextInputState()
             if let ch = event.charactersIgnoringModifiers {
                 if let fs = ch.unicodeScalars.first {
                     switch Int (fs.value) {
@@ -1120,6 +1131,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                 return
             }
         } else if eventFlags.contains (.function) {
+            resetTextInputState()
             if let str = event.charactersIgnoringModifiers {
                 if let fs = str.unicodeScalars.first {
                     let c = Int (fs.value)
@@ -1163,14 +1175,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                     case NSPageDownFunctionKey:
                         pageDown()
                     default:
-                        interpretKeyEvents([event])
+                        interpretPendingKeyEvent(event)
                     }
                 }
             }
             return
         }
         
-        interpretKeyEvents([event])
+        interpretPendingKeyEvent(event)
     }
 
     public override func keyUp(with event: NSEvent) {
@@ -1195,34 +1207,69 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if !terminal.keyboardEnhancementFlags.isEmpty {
             switch selector {
             case #selector(insertNewline(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.enter) { return }
             case #selector(cancelOperation(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.escape) { return }
             case #selector(deleteBackward(_:)):
+                if handleTextInputDeleteBackward() { return }
+                resetTextInputState()
                 if sendKittyFunctionalKey(.backspace) { return }
+            case #selector(deleteForward(_:)):
+                resetTextInputState()
+                switch deleteForwardCommandKind(for: pendingInterpretedKeyEvent) {
+                case .eof:
+                    if let event = pendingInterpretedKeyEvent,
+                       let kittyEvent = kittyTextEvent(from: event, eventType: .press),
+                       sendKittyEvent(kittyEvent) {
+                        return
+                    }
+                    let kittyEvent = KittyKeyEvent(key: .unicode(UInt32(UnicodeScalar(UInt8(ascii: "d")).value)),
+                                                   modifiers: [.ctrl],
+                                                   eventType: .press,
+                                                   text: nil,
+                                                   shiftedKey: nil,
+                                                   baseLayoutKey: nil,
+                                                   composing: kittyIsComposing)
+                    if sendKittyEvent(kittyEvent) { return }
+                case .forwardDelete:
+                    if sendKittyFunctionalKey(.delete) { return }
+                }
             case #selector(moveUp(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.up) { return }
             case #selector(moveDown(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.down) { return }
             case #selector(moveLeft(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.left) { return }
             case #selector(moveRight(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.right) { return }
             case #selector(insertTab(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.tab) { return }
             case #selector(insertBacktab(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.tab, modifiers: [.shift]) { return }
             case #selector(moveToBeginningOfLine(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.home) { return }
             case #selector(scrollToBeginningOfDocument(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.home) { return }
             case #selector(moveToEndOfLine(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.end) { return }
             case #selector(scrollToEndOfDocument(_:)):
+                resetTextInputState()
                 if sendKittyFunctionalKey(.end) { return }
             case #selector(scrollPageUp(_:)):
                 fallthrough
             case #selector(pageUp(_:)):
+                resetTextInputState()
                 if terminal.applicationCursor {
                     if sendKittyFunctionalKey(.pageUp) { return }
                 } else {
@@ -1232,6 +1279,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             case #selector(scrollPageDown(_:)):
                 fallthrough
             case #selector(pageDown(_:)):
+                resetTextInputState()
                 if terminal.applicationCursor {
                     if sendKittyFunctionalKey(.pageDown) { return }
                 } else {
@@ -1244,34 +1292,57 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
         switch selector {
         case #selector(insertNewline(_:)):
+            resetTextInputState()
             send (EscapeSequences.cmdRet)
         case #selector(cancelOperation(_:)):
+            resetTextInputState()
             send (EscapeSequences.cmdEsc)
         case #selector(deleteBackward(_:)):
-            send ([backspaceSendsControlH ? 8 : 0x7f])
+            if !handleTextInputDeleteBackward() {
+                sendBackspace(count: 1)
+            }
+        case #selector(deleteForward(_:)):
+            resetTextInputState()
+            switch deleteForwardCommandKind(for: pendingInterpretedKeyEvent) {
+            case .eof:
+                send([0x04])
+            case .forwardDelete:
+                send(EscapeSequences.cmdDelKey)
+            }
         case #selector(moveUp(_:)):
+            resetTextInputState()
             sendKeyUp()
         case #selector(moveDown(_:)):
+            resetTextInputState()
             sendKeyDown()
         case #selector(moveLeft(_:)):
+            resetTextInputState()
             sendKeyLeft()
         case #selector(moveRight(_:)):
+            resetTextInputState()
             sendKeyRight()
         case #selector(insertTab(_:)):
+            resetTextInputState()
             send (EscapeSequences.cmdTab)
         case #selector(insertBacktab(_:)):
+            resetTextInputState()
             send (EscapeSequences.cmdBackTab)
         case #selector(moveToBeginningOfLine(_:)):
+            resetTextInputState()
             send (terminal.applicationCursor ? EscapeSequences.moveHomeApp : EscapeSequences.moveHomeNormal)
         case #selector(scrollToBeginningOfDocument(_:)):
+            resetTextInputState()
             send (terminal.applicationCursor ? EscapeSequences.moveHomeApp : EscapeSequences.moveHomeNormal)
         case #selector(moveToEndOfLine(_:)):
+            resetTextInputState()
             send (terminal.applicationCursor ? EscapeSequences.moveEndApp : EscapeSequences.moveEndNormal)
         case #selector(scrollToEndOfDocument(_:)):
+            resetTextInputState()
             send (terminal.applicationCursor ? EscapeSequences.moveEndApp : EscapeSequences.moveEndNormal)
         case #selector(scrollPageUp(_:)):
             fallthrough
         case #selector(pageUp(_:)):
+            resetTextInputState()
             if terminal.applicationCursor {
                 send (EscapeSequences.cmdPageUp)
             } else {
@@ -1280,21 +1351,25 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         case #selector(scrollPageDown(_:)):
             fallthrough
         case #selector(pageDown(_:)):
+            resetTextInputState()
             if terminal.applicationCursor {
                 send (EscapeSequences.cmdPageDown)
             } else {
                 pageDown()
             }
         case #selector(pageDownAndModifySelection(_:)):
+            resetTextInputState()
             if terminal.applicationCursor {
                 // TODO: view should scroll one page up.
             } else {
                 send (EscapeSequences.cmdPageDown)
             }
         case #selector(moveToLeftEndOfLine(_:)):
+            resetTextInputState()
             // Apple sends the Emacs back-word commands
             send (EscapeSequences.emacsBack)
         case #selector(moveToRightEndOfLine(_:)):
+            resetTextInputState()
             send (EscapeSequences.emacsForward)
         default:
             print ("Unhandle selector \(selector)")
@@ -1303,73 +1378,75 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func insertText(_ string: Any, replacementRange: NSRange) {
-        _markedText.mutableString.setString("")
         insertText(string, replacementRange: replacementRange, isPaste: false)
     }
 
     func insertText(_ string: Any, replacementRange: NSRange, isPaste: Bool) {
-        if let str = string as? NSString {
-            if !terminal.keyboardEnhancementFlags.isEmpty {
-                if isPaste, terminal.bracketedPasteMode {
-                    pendingKittyKeyEvent = nil
-                    send(data: EscapeSequences.bracketedPasteStart[0...])
-                    send (txt: str as String)
-                    send(data: EscapeSequences.bracketedPasteEnd[0...])
-                    return
-                }
-                let pendingEvent = pendingKittyKeyEvent
+        guard let text = inputText(from: string) else {
+            return
+        }
+
+        let tracksTextInputState = !isPaste || Self.shouldTrackInlinePaste(text)
+        if !tracksTextInputState {
+            resetTextInputState()
+        } else {
+            let commit = textInputState.insertText(text, replacementRange: replacementRange)
+            refreshMarkedTextOverlay()
+            if commit.backspaceCount > 0 {
+                sendBackspace(count: commit.backspaceCount)
+            }
+        }
+
+        if !terminal.keyboardEnhancementFlags.isEmpty {
+            if isPaste, terminal.bracketedPasteMode {
                 pendingKittyKeyEvent = nil
-                let text = str as String
-                let kittyEvent: KittyKeyEvent
-                if text.unicodeScalars.count == 1,
-                   let pendingEvent,
-                   let event = kittyTextEvent(from: pendingEvent.event, eventType: pendingEvent.eventType, text: text) {
-                    kittyEvent = event
-                } else {
-                    kittyEvent = kittyTextEventFromText(text)
-                }
-                _ = sendKittyEvent(kittyEvent)
+                send(data: EscapeSequences.bracketedPasteStart[0...])
+                send (txt: text)
+                send(data: EscapeSequences.bracketedPasteEnd[0...])
                 return
             }
-            if isPaste, terminal.bracketedPasteMode {
-                send(data: EscapeSequences.bracketedPasteStart[0...])
+            let pendingEvent = pendingKittyKeyEvent
+            pendingKittyKeyEvent = nil
+            let kittyEvent: KittyKeyEvent
+            if text.unicodeScalars.count == 1,
+               let pendingEvent,
+               let event = kittyTextEvent(from: pendingEvent.event, eventType: pendingEvent.eventType, text: text) {
+                kittyEvent = event
+            } else {
+                kittyEvent = kittyTextEventFromText(text)
             }
-            send (txt: str as String)
-            if isPaste, terminal.bracketedPasteMode {
-                send(data: EscapeSequences.bracketedPasteEnd[0...])
-            }
+            _ = sendKittyEvent(kittyEvent)
+            return
+        }
+
+        if isPaste, terminal.bracketedPasteMode {
+            send(data: EscapeSequences.bracketedPasteStart[0...])
+        }
+        send (txt: text)
+        if isPaste, terminal.bracketedPasteMode {
+            send(data: EscapeSequences.bracketedPasteEnd[0...])
         }
         // TODO: I do not think we actually need this needsDisplay, the data fed should bubble this up
         // needsDisplay = true
     }
+
+    static func shouldTrackInlinePaste(_ text: String) -> Bool {
+        guard !text.isEmpty else {
+            return false
+        }
+
+        return !text.unicodeScalars.contains { scalar in
+            scalar.value < 0x20 || scalar.value == 0x7f
+        }
+    }
     
     // NSTextInputClient protocol implementation
     open func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        switch string {
-        case let v as NSAttributedString:
-            _markedText.setAttributedString(v)
-        case let v as String:
-            _markedText.mutableString.setString(v)
-        default:
-            _markedText.mutableString.setString("")
-        }
-
-        let hasText = _markedText.length > 0
-#if canImport(MetalKit)
-        if metalView != nil {
-            compositionOverlay?.isHidden = !hasText
-            if hasText {
-                compositionOverlay?.needsDisplay = true
-            }
-            requestMetalDisplay()
-        } else {
-            caretView?.isHidden = hasText
-            needsDisplay = true
-        }
-#else
-        caretView?.isHidden = hasText
-        needsDisplay = true
-#endif
+        let text = inputText(from: string)
+        textInputState.setMarkedText(inputText(from: string),
+                                     selectedRange: selectedRange,
+                                     replacementRange: replacementRange)
+        refreshMarkedTextOverlay()
     }
 
     private func kittyEncoder() -> KittyKeyboardEncoder {
@@ -1740,60 +1817,134 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                                   composing: kittyIsComposing)
         return sendKittyEvent(event)
     }
-    
-    // NSTextInputClient protocol implementation
-    open func unmarkText() {
-        guard _markedText.length > 0 else { return }
-        _markedText.mutableString.setString("")
+
+    private func inputText(from value: Any) -> String? {
+        switch value {
+        case let attributed as NSAttributedString:
+            return attributed.string
+        case let string as NSString:
+            return string as String
+        case let string as String:
+            return string
+        default:
+            return nil
+        }
+    }
+
+    private func interpretPendingKeyEvent(_ event: NSEvent) {
+        let previousEvent = pendingInterpretedKeyEvent
+        pendingInterpretedKeyEvent = event
+        interpretKeyEvents([event])
+        pendingInterpretedKeyEvent = previousEvent
+    }
+
+    static func deleteForwardCommandKind(modifierFlags: NSEvent.ModifierFlags,
+                                         characters: String?,
+                                         charactersIgnoringModifiers: String?) -> DeleteForwardCommandKind {
+        guard modifierFlags.contains(.control) else {
+            return .forwardDelete
+        }
+
+        for candidate in [charactersIgnoringModifiers, characters] {
+            guard let candidate,
+                  let byte = controlByte(forEventCharacters: candidate) else {
+                continue
+            }
+            if byte == 0x04 {
+                return .eof
+            }
+        }
+
+        return .forwardDelete
+    }
+
+    private func deleteForwardCommandKind(for event: NSEvent?) -> DeleteForwardCommandKind {
+        guard let event else {
+            return .forwardDelete
+        }
+        return Self.deleteForwardCommandKind(modifierFlags: event.modifierFlags,
+                                             characters: event.characters,
+                                             charactersIgnoringModifiers: event.charactersIgnoringModifiers)
+    }
+
+    private func sendBackspace(count: Int) {
+        guard count > 0 else {
+            return
+        }
+
+        let byte: UInt8 = backspaceSendsControlH ? 8 : 0x7f
+        for _ in 0..<count {
+            send([byte])
+        }
+    }
+
+    private func handleTextInputDeleteBackward() -> Bool {
+        guard let result = textInputState.deleteBackward() else {
+            return false
+        }
+
+        refreshMarkedTextOverlay()
+        if case .hostBackspaces(let count) = result {
+            sendBackspace(count: count)
+        }
+        return true
+    }
+
+    private func resetTextInputState() {
+        guard textInputState.hasMarkedText || !textInputState.string.isEmpty else {
+            return
+        }
+
+        textInputState.reset()
+        refreshMarkedTextOverlay()
+    }
+
+    private func refreshMarkedTextOverlay() {
+        _markedText.mutableString.setString(textInputState.markedText ?? "")
+        inputContext?.invalidateCharacterCoordinates()
+
+        let hasText = textInputState.hasMarkedText
 #if canImport(MetalKit)
         if metalView != nil {
-            compositionOverlay?.isHidden = true
+            compositionOverlay?.isHidden = !hasText
+            if hasText {
+                compositionOverlay?.needsDisplay = true
+            }
             requestMetalDisplay()
         } else {
-            caretView?.isHidden = false
+            caretView?.isHidden = hasText
             needsDisplay = true
         }
 #else
-        caretView?.isHidden = false
+        caretView?.isHidden = hasText
         needsDisplay = true
 #endif
     }
     
     // NSTextInputClient protocol implementation
+    open func unmarkText() {
+        textInputState.unmarkText()
+        refreshMarkedTextOverlay()
+    }
+    
+    // NSTextInputClient protocol implementation
     open func selectedRange() -> NSRange {
-        guard let selection = self.selection, selection.active else {
-            // This means "no selection":
-            return NSRange.empty
-        }
-        
-        let displayBuffer = terminal.displayBuffer
-        var startLocation = (selection.start.row * displayBuffer.rows) + selection.start.col
-        var endLocation = (selection.end.row * displayBuffer.rows) + selection.end.col
-        if startLocation > endLocation {
-            swap(&startLocation, &endLocation)
-        }
-        let length = endLocation - startLocation
-        if length == 0 {
-            return NSRange.empty
-        }
-        return NSRange(location: startLocation, length: endLocation - startLocation)
+        return textInputState.selectedRange
     }
     
     // NSTextInputClient protocol implementation
     open func markedRange() -> NSRange {
-        guard _markedText.length > 0 else { return NSRange.empty }
-        return NSRange(location: 0, length: _markedText.length)
+        return textInputState.markedRange ?? NSRange(location: NSNotFound, length: 0)
     }
 
     // NSTextInputClient protocol implementation
     open func hasMarkedText() -> Bool {
-        _markedText.length > 0
+        textInputState.hasMarkedText
     }
     
     // NSTextInputClient protocol implementation
     open func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        print ("Attribuetd string")
-        return nil
+        textInputState.attributedSubstring(forProposedRange: range, actualRange: actualRange)
     }
     
     // NSTextInputClient Protocol implementation
@@ -1815,10 +1966,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func characterIndex(for point: NSPoint) -> Int {
-        print ("characterIndex:for point: This should return the actual range from the selection")
-        return NSNotFound
+        return textInputState.selectedRange.location
     }
-    
+
     open func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
         //print ("Validating selector: \(item.action)")
         switch item.action {
@@ -2043,7 +2193,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     {
         let clipboard = NSPasteboard.general
         let text = clipboard.string(forType: .string)
-        insertText(text ?? "", replacementRange: NSRange(location: 0, length: 0), isPaste: true)
+        insertText(text ?? "", replacementRange: NSRange(location: NSNotFound, length: 0), isPaste: true)
     }
     
     @objc
@@ -2125,6 +2275,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     public override func mouseDown(with event: NSEvent) {
+        resetTextInputState()
         if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(with: event)
             return

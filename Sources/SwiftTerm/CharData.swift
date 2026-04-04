@@ -238,6 +238,8 @@ public struct TinyAtom {
  * It is possible to change the value of the stored character by calling the `setValue` method.
  */
 public struct CharData: CustomDebugStringConvertible {
+    private static let vs16FollowerFlag: UInt8 = 1 << 0
+
     public var debugDescription: String {
         let ch: Character
         if let scalar = UnicodeScalar(Int(code)) {
@@ -325,6 +327,20 @@ public struct CharData: CustomDebugStringConvertible {
     {
         self.code = code
         width = Int8 (size)
+        unused = 0
+    }
+
+    var isVs16WideFollower: Bool {
+        get {
+            (unused & CharData.vs16FollowerFlag) != 0
+        }
+        set {
+            if newValue {
+                unused |= CharData.vs16FollowerFlag
+            } else {
+                unused &= ~CharData.vs16FollowerFlag
+            }
+        }
     }
     
     /// Use this method to retrieve the Character stored in the CharData

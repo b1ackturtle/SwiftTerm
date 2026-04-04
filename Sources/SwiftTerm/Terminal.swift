@@ -1112,6 +1112,30 @@ open class Terminal {
         {
             count-idx
         }
+
+        func peekBytes(_ length: Int) -> [UInt8]?
+        {
+            guard length >= 0, bytesLeft() >= length else {
+                return nil
+            }
+
+            if length == 0 {
+                return []
+            }
+
+            var result: [UInt8] = []
+            result.reserveCapacity(length)
+            for offset in 0..<length {
+                let sourceIndex = idx + offset
+                if sourceIndex < putbackBuffer.count {
+                    result.append(putbackBuffer[sourceIndex])
+                } else {
+                    let restIndex = sourceIndex - putbackBuffer.count + rest.startIndex
+                    result.append(rest[restIndex])
+                }
+            }
+            return result
+        }
         
         mutating func getNext () -> UInt8
         {
@@ -1212,7 +1236,7 @@ open class Terminal {
                         // Every single mapping in the charset only takes one slot
                         chWidth = 1
                         let charData = makeCharData (attribute: curAttr, char: ch, size: Int8 (chWidth))
-                        buffer.insertCharacter(charData)
+                        insertCharacter(charData)
                         continue
                     }
                 }
@@ -1221,7 +1245,7 @@ open class Terminal {
                 chWidth = UnicodeUtil.columnWidth(rune: rune)
 		if chWidth > 0 {
                 	let charData = makeCharData (attribute: curAttr, scalar: rune, size: Int8 (chWidth))
-                	buffer.insertCharacter(charData)
+                	insertCharacter(charData)
 		}
                 continue
             } else if readingBuffer.bytesLeft() >= (n-1) {
@@ -1241,7 +1265,7 @@ open class Terminal {
                     chWidth = UnicodeUtil.columnWidth(rune: rune)
                     if chWidth > 0 {
                     	let charData = makeCharData (attribute: curAttr, scalar: rune, size: Int8 (chWidth))
-                    	buffer.insertCharacter(charData)
+                    	insertCharacter(charData)
 		    }
                     continue
                 }
@@ -1260,6 +1284,18 @@ open class Terminal {
                         }
                         chWidth = max (chWidth, width)
                     }
+                }
+
+                if ch.unicodeScalars.count == 1,
+                   let scalar = ch.unicodeScalars.first,
+                   UnicodeUtil.isEmojiVs16Base(rune: scalar),
+                   readingBuffer.peekBytes(3) == [0xEF, 0xB8, 0x8F]
+                {
+                    _ = readingBuffer.getNext()
+                    _ = readingBuffer.getNext()
+                    _ = readingBuffer.getNext()
+                    ch = Character(String(String.UnicodeScalarView([scalar, UnicodeScalar(0xFE0F)!])))
+                    chWidth = UnicodeUtil.columnWidth(character: ch)
                 }
             } else {
                 readingBuffer.putback (code)
@@ -1333,7 +1369,8 @@ open class Terminal {
                                     if oldSize != 2 && lastx + 1 < cols {
                                         updateCharData(&cd, char: newCh, size: 2)
                                         let nextX = lastx + 1
-                                        let empty = makeCharData (attribute: cd.attribute, code: 0, size: 0)
+                                        var empty = makeCharData (attribute: cd.attribute, code: 0, size: 0)
+                                        empty.isVs16WideFollower = true
                                         existingLine [nextX] = empty
                                         buffer.x += 1
                                     } else {
@@ -1361,13 +1398,16 @@ open class Terminal {
             if chWidth == 0 {
                 continue
             }
+            if rewriteNarrowVs16BaseAsWideIfNeeded(ch, width: chWidth) {
+                continue
+            }
             // The accessibility stack might not need this
             //let screenReaderMode = options.screenReaderMode
             //if screenReaderMode {
             //    emitChar (ch)
             //}
             let charData = makeCharData (attribute: curAttr, char: ch, size: Int8 (chWidth))
-            buffer.insertCharacter(charData)
+            insertCharacter(charData)
         }
         updateRange(borrowing: buffer, buffer.y)
         readingBuffer.done ()
@@ -1435,9 +1475,112 @@ open class Terminal {
     // Inserts the specified character with the computed width into the next cell, following
     // the rules for wrapping around, scrolling and overflow expected in the terminal.
     func insertCharacter (_ charData: CharData) {
+        if rewriteNarrowVs16BaseAsWideIfNeeded(charData) {
+            return
+        }
+
         // TODO, make this a direct call. no need to pproxy here
         buffer.insertCharacter(
             charData)
+        markVs16FollowerIfNeeded(for: charData)
+    }
+
+    private func rewriteNarrowVs16BaseAsWideIfNeeded(_ character: Character, width: Int) -> Bool {
+        guard width == 2 else {
+            return false
+        }
+
+        let scalars = Array(character.unicodeScalars)
+        guard scalars.count == 2,
+              scalars[1].value == 0xFE0F
+        else {
+            return false
+        }
+
+        let right = marginMode ? buffer.marginRight : cols - 1
+        guard buffer.x >= 0,
+              buffer.x < right,
+              buffer.y + buffer.yBase >= 0,
+              buffer.y + buffer.yBase < buffer.lines.count
+        else {
+            return false
+        }
+
+        let line = buffer.lines[buffer.y + buffer.yBase]
+        let existing = line[buffer.x]
+        guard existing.width == 1,
+              !existing.isVs16WideFollower,
+              getCharacter(for: existing).unicodeScalars.elementsEqual([scalars[0]])
+        else {
+            return false
+        }
+
+        let charData = makeCharData(attribute: curAttr, char: character, size: Int8(width))
+        buffer.expandNarrowCharacterToWide(charData, fillAttribute: charData.attribute)
+        return true
+    }
+
+    private func rewriteNarrowVs16BaseAsWideIfNeeded(_ charData: CharData) -> Bool {
+        guard charData.width == 2 else {
+            return false
+        }
+
+        let newCharacter = getCharacter(for: charData)
+        let scalars = Array(newCharacter.unicodeScalars)
+        guard scalars.count == 2,
+              scalars[1].value == 0xFE0F
+        else {
+            return false
+        }
+
+        let right = marginMode ? buffer.marginRight : cols - 1
+        guard buffer.x >= 0,
+              buffer.x < right,
+              buffer.y + buffer.yBase >= 0,
+              buffer.y + buffer.yBase < buffer.lines.count
+        else {
+            return false
+        }
+
+        let line = buffer.lines[buffer.y + buffer.yBase]
+        let existing = line[buffer.x]
+        guard existing.width == 1,
+              !existing.isVs16WideFollower,
+              getCharacter(for: existing).unicodeScalars.elementsEqual([scalars[0]])
+        else {
+            return false
+        }
+
+        buffer.expandNarrowCharacterToWide(charData, fillAttribute: charData.attribute)
+        return true
+    }
+
+    private func markVs16FollowerIfNeeded(for charData: CharData) {
+        guard charData.width > 1,
+              getCharacter(for: charData).unicodeScalars.contains(where: { $0.value == 0xFE0F })
+        else {
+            return
+        }
+
+        let last = buffer.lastBufferStorage
+        guard last.cols == cols,
+              last.rows == rows
+        else {
+            return
+        }
+
+        let followerX = last.x + 1
+        guard last.y >= 0,
+              last.y < buffer.lines.count,
+              followerX >= 0,
+              followerX < cols
+        else {
+            return
+        }
+
+        var follower = buffer.lines[last.y][followerX]
+        follower.isVs16WideFollower = true
+        buffer.lines[last.y][followerX] = follower
     }
     
 //    func insertCharacter2(_ charData: CharData) {
@@ -1558,7 +1701,7 @@ open class Terminal {
         let right = marginMode ? buffer.marginRight : buffer.cols-1
 
         if buffer.x > left {
-            buffer.x -= 1
+            buffer.x = previousColumnForBackwardCursorMove(leftLimit: left)
         } else if reverseWraparound {
             if buffer.x <= left {
                 if buffer.y > buffer.scrollTop && buffer.y <= buffer.scrollBottom && (buffer.lines [buffer.y + buffer.yBase].isWrapped || marginMode) {
@@ -1586,10 +1729,132 @@ open class Terminal {
             } else if buffer.x > left {
                 // If we have not reached the limit, we can go back, otherwise stop at the margin
                 // Test BS_StopsAtLeftMargin
-                buffer.x -= 1
+                buffer.x = previousColumnForBackwardCursorMove(leftLimit: left)
             
             }
         }
+    }
+
+    private func previousColumnForBackwardCursorMove(leftLimit: Int) -> Int
+    {
+        let buffer = self.buffer
+        let target = buffer.x - 1
+        guard target > leftLimit else {
+            return leftLimit
+        }
+
+        let line = buffer.lines[buffer.y + buffer.yBase]
+        guard target < line.count,
+              line[target].code == 0
+        else {
+            return target
+        }
+
+        let leaderIndex = target - 1
+        guard leaderIndex >= leftLimit else {
+            return leftLimit
+        }
+
+        if line[target].isVs16WideFollower {
+            return leaderIndex
+        }
+
+        let leader = line[leaderIndex]
+        guard leader.width > 1,
+              glyphUsesVariationSelectorWideBackspace(leader)
+        else {
+            return target
+        }
+
+        return leaderIndex
+    }
+
+    private func nextColumnForForwardCursorMove(rightLimit: Int) -> Int
+    {
+        let buffer = self.buffer
+        let current = buffer.x
+        guard current < rightLimit else {
+            return rightLimit
+        }
+
+        let line = buffer.lines[buffer.y + buffer.yBase]
+        guard current < line.count else {
+            return min(rightLimit, current + 1)
+        }
+
+        if current + 1 < line.count,
+           line[current + 1].isVs16WideFollower
+        {
+            return min(rightLimit, current + 2)
+        }
+
+        let cell = line[current]
+        if cell.width > 1,
+           glyphUsesVariationSelectorWideBackspace(cell)
+        {
+            return min(rightLimit, current + Int(cell.width))
+        }
+
+        if cell.code == 0,
+           current > 0
+        {
+            let leader = line[current - 1]
+            if leader.width > 1,
+               glyphUsesVariationSelectorWideBackspace(leader)
+            {
+                return min(rightLimit, current + 1)
+            }
+        }
+
+        return min(rightLimit, current + 1)
+    }
+
+    private func glyphUsesVariationSelectorWideBackspace(_ cell: CharData) -> Bool
+    {
+        getCharacter(for: cell).unicodeScalars.contains { $0.value == 0xFE0F }
+    }
+
+    private func rawCellSpanForHostVisibleColumn(in line: BufferLine, at col: Int) -> Int
+    {
+        guard col >= 0, col < line.count else {
+            return 1
+        }
+
+        if col + 1 < line.count,
+           line[col + 1].isVs16WideFollower
+        {
+            return 2
+        }
+
+        let cell = line[col]
+        if cell.width > 1,
+           glyphUsesVariationSelectorWideBackspace(cell)
+        {
+            return Int(cell.width)
+        }
+
+        return 1
+    }
+
+    private func rawCellSpanForHostVisibleColumns(in line: BufferLine, startCol: Int, count: Int, rightLimit: Int) -> Int
+    {
+        guard count > 0, startCol <= rightLimit else {
+            return 0
+        }
+
+        var rawCount = 0
+        var currentCol = startCol
+        var remaining = count
+
+        while remaining > 0 && currentCol <= rightLimit {
+            let rawStep = rawCellSpanForHostVisibleColumn(in: line, at: currentCol)
+            let boundedStep = min(rawStep, rightLimit - currentCol + 1)
+            rawCount += boundedStep
+            currentCol += boundedStep
+            remaining -= 1
+        }
+
+        return rawCount
     }
     
     func cmdCarriageReturn ()
@@ -2127,9 +2392,14 @@ open class Terminal {
         if buffer.x > right {
             right = buffer.cols - 1
         }
-        buffer.x += (max (count, 1))
-        if buffer.x > right {
-            buffer.x = right
+
+        let steps = max(count, 1)
+        for _ in 0..<steps {
+            if buffer.x >= right {
+                buffer.x = right
+                break
+            }
+            buffer.x = nextColumnForForwardCursorMove(rightLimit: right)
         }
     }
 
@@ -2153,11 +2423,14 @@ open class Terminal {
         if buffer.x < left {
             left = 0
         }
-        let newX = buffer.x - max (1, count)
-        if newX < left {
-            buffer.x = left
-        } else {
-            buffer.x = newX
+
+        let steps = max(1, count)
+        for _ in 0..<steps {
+            if buffer.x <= left {
+                buffer.x = left
+                break
+            }
+            buffer.x = previousColumnForBackwardCursorMove(leftLimit: left)
         }
     }
 
@@ -4709,22 +4982,25 @@ open class Terminal {
     func cmdDeleteChars (_ pars: [Int], _ collect: cstring)
     {
         let buffer = self.buffer
-        var p = max (pars.count == 0 ? 1 : pars [0], 1)
+        let p = max (pars.count == 0 ? 1 : pars [0], 1)
+        let rightMargin = marginMode ? buffer.marginRight : cols-1
         
         if marginMode {
             if buffer.x < buffer.marginLeft || buffer.x > buffer.marginRight {
                 return
-            }
-            if buffer.x + p > buffer.marginRight {
-                p = buffer.marginRight - buffer.x + 1
             }
         }
         // buffer.x = buffer.cols is a special case on the edge, we do not delete columns in that boundary
         if buffer.x == buffer.cols {
             return
         }
+        let line = buffer.lines[buffer.y + buffer.yBase]
+        let rawDeleteCount = rawCellSpanForHostVisibleColumns(in: line, startCol: buffer.x, count: p, rightLimit: rightMargin)
+        guard rawDeleteCount > 0 else {
+            return
+        }
         buffer.lines [buffer.y + buffer.yBase].deleteCells (
-            pos: buffer.x, n: p, rightMargin: marginMode ? buffer.marginRight : cols-1, fillData: CharData (attribute: eraseAttr ()))
+            pos: buffer.x, n: rawDeleteCount, rightMargin: rightMargin, fillData: CharData (attribute: eraseAttr ()))
         
         updateRange (buffer.y)
     }
@@ -6078,6 +6354,35 @@ open class Terminal {
             }
         }
         return nil
+    }
+
+    func resolvedWideCell(in line: BufferLine, at col: Int) -> (col: Int, cell: CharData)? {
+        guard line.count > 0 else {
+            return nil
+        }
+        let maxCol = max(0, min(cols - 1, line.count - 1))
+        let clampedCol = max(0, min(col, maxCol))
+        let cell = line[clampedCol]
+        if cell.width == 0 && clampedCol > 0 {
+            let leader = line[clampedCol - 1]
+            if leader.width > 1 {
+                return (clampedCol - 1, leader)
+            }
+        }
+        return (clampedCol, cell)
+    }
+
+    func resolvedCursorCell(in line: BufferLine, at col: Int) -> (col: Int, cell: CharData, renderWidth: Int)? {
+        guard let resolved = resolvedWideCell(in: line, at: col) else {
+            return nil
+        }
+        let renderWidth: Int
+        if resolved.cell.width > 1 && getCharacter(for: resolved.cell) == " " {
+            renderWidth = 1
+        } else {
+            renderWidth = max(1, Int(resolved.cell.width))
+        }
+        return (resolved.col, resolved.cell, renderWidth)
     }
 
     private struct GhosttyImplicitCellRef {

@@ -761,6 +761,14 @@ extension TerminalView {
         return nil
     }
 
+    func resolvedWideCell(in line: BufferLine, at col: Int) -> (col: Int, cell: CharData)? {
+        terminal.resolvedWideCell(in: line, at: col)
+    }
+
+    func resolvedCursorCell(in line: BufferLine, at col: Int) -> (col: Int, cell: CharData, renderWidth: Int)? {
+        terminal.resolvedCursorCell(in: line, at: col)
+    }
+
     func payloadString(at position: Position) -> String?
     {
         let buffer = terminal.displayBuffer
@@ -768,17 +776,12 @@ extension TerminalView {
             return nil
         }
         let line = buffer.lines[position.row]
-        let maxCol = max(0, min(terminal.cols - 1, line.count - 1))
-        let col = max(0, min(position.col, maxCol))
-        let cell = line[col]
+        guard let resolved = resolvedWideCell(in: line, at: position.col) else {
+            return nil
+        }
+        let cell = resolved.cell
         if let payload = cell.getPayload() as? String {
             return payload
-        }
-        if cell.code == 0 && col > 0 && line[col - 1].width == 2 {
-            let base = line[col - 1]
-            if let payload = base.getPayload() as? String {
-                return payload
-            }
         }
         return nil
     }
@@ -1291,7 +1294,6 @@ extension TerminalView {
                     }
                     let runAttributes = CTRunGetAttributes(run) as? [NSAttributedString.Key: Any] ?? [:]
                     let startColumn = prepared.segment.column + (processedGlyphs * prepared.segment.columnWidth)
-                    let endColumn = startColumn + (runGlyphsCount * prepared.segment.columnWidth)
                     var backgroundColor: TTColor?
                     if runAttributes.keys.contains(.selectionBackgroundColor) {
                         backgroundColor = runAttributes[.selectionBackgroundColor] as? TTColor
@@ -1300,7 +1302,7 @@ extension TerminalView {
                     }
 
                     if let backgroundColor = backgroundColor {
-                        let columnSpan = max(0, endColumn - startColumn)
+                        let columnSpan = max(0, runGlyphsCount * prepared.segment.columnWidth)
                         if columnSpan > 0 {
                             context.setFillColor(backgroundColor.cgColor)
 
@@ -1318,7 +1320,7 @@ extension TerminalView {
                             }
                             #endif
 
-                            if endColumn >= terminal.cols {
+                            if startColumn + columnSpan >= terminal.cols {
                                 rect.size.width = frame.width - rect.origin.x
                             }
 
@@ -1376,7 +1378,6 @@ extension TerminalView {
                     let runAttributes = CTRunGetAttributes(run) as? [NSAttributedString.Key: Any] ?? [:]
                     let runFont = runAttributes[.font] as! TTFont
                     let startColumn = prepared.segment.column + (processedGlyphs * prepared.segment.columnWidth)
-
                     let runGlyphs = [CGGlyph](unsafeUninitializedCapacity: runGlyphsCount) { (bufferPointer, count) in
                         CTRunGetGlyphs(run, CFRange(), bufferPointer.baseAddress!)
                         count = runGlyphsCount
@@ -1681,10 +1682,13 @@ extension TerminalView {
         let offset = (cellDimension.height * (CGFloat(buffer.y-(buffer.yDisp-buffer.yBase)+1)))
         let lineOrigin = CGPoint(x: 0, y: frame.height - offset)
         #endif
-        let ch = buffer.lines [vy][buffer.x]
-        let charWidth = CGFloat(max(1, Int(ch.width)))
+        guard let resolvedCursor = resolvedCursorCell(in: buffer.lines[vy], at: buffer.x) else {
+            return
+        }
+        let ch = resolvedCursor.cell
+        let charWidth = CGFloat(resolvedCursor.renderWidth)
         caretView.frame.size.width = cellDimension.width * charWidth
-        caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(buffer.x)), y: lineOrigin.y)
+        caretView.frame.origin = CGPoint(x: lineOrigin.x + (cellDimension.width * doublePosition * CGFloat(resolvedCursor.col)), y: lineOrigin.y)
         caretView.setText (ch: ch)
         #if os(macOS)
         if !hasMarkedText() {
@@ -1763,35 +1767,47 @@ extension TerminalView {
     /// This takes a string returned by events (NSEvent or UIKey) as the 'charactersIngoringModifiers'
     /// and returns the control-version of that, and only applies to a handful of characters
     ///
-    func applyControlToEventCharacters (_ ch: String) -> [UInt8]
+    static func controlByte(forEventCharacters ch: String) -> UInt8?
     {
         let arr = [UInt8](ch.utf8)
-        if arr.count == 1 {
-            let ch = Character (UnicodeScalar (arr [0]))
-            var value: UInt8
-            switch ch {
-            case "A"..."Z":
-                value = (ch.asciiValue! - 0x40 /* - 'A' + 1 */)
-            case "a"..."z":
-                value = (ch.asciiValue! - 0x60 /* - 'a' + 1 */)
-            case "\\":
-                value = 0x1c
-            case "_":
-                value = 0x1f
-            case "]":
-                value = 0x1d
-            case "[":
-                value = 0x1b
-            case "^", "6":
-                value = 0x1e
-            case " ":
-                value = 0
-            default:
-                return []
-            }
-            return [value]
+        guard arr.count == 1 else {
+            return nil
         }
-        return []
+
+        let byte = arr[0]
+        if byte <= 0x1f || byte == 0x7f {
+            return byte
+        }
+
+        let ch = Character (UnicodeScalar (byte))
+        switch ch {
+        case "A"..."Z":
+            return (ch.asciiValue! - 0x40 /* - 'A' + 1 */)
+        case "a"..."z":
+            return (ch.asciiValue! - 0x60 /* - 'a' + 1 */)
+        case "\\":
+            return 0x1c
+        case "_":
+            return 0x1f
+        case "]":
+            return 0x1d
+        case "[":
+            return 0x1b
+        case "^", "6":
+            return 0x1e
+        case " ":
+            return 0
+        default:
+            return nil
+        }
+    }
+
+    func applyControlToEventCharacters (_ ch: String) -> [UInt8]
+    {
+        guard let byte = Self.controlByte(forEventCharacters: ch) else {
+            return []
+        }
+        return [byte]
     }
     /**
      * Returns the thumb size in proportion to the visible content of the entire content, alternate buffers are not scrollable, so this returns 0

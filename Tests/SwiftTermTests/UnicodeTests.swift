@@ -354,6 +354,14 @@ final class SwiftTermUnicode {
         #expect(t.getCharacter(col: 2, row: 0) == "x")
     }
 
+    @Test func testUnicodeUtilCharacterWidthsMatchImeOverlayNeeds() {
+        #expect(UnicodeUtil.columnWidth(character: "☀️") == 2)
+        #expect(UnicodeUtil.columnWidth(character: "❤️") == 2)
+        #expect(UnicodeUtil.columnWidth(character: "1️⃣") == 2)
+        #expect(UnicodeUtil.columnWidth(character: "1\u{FE0E}\u{20E3}") == 1)
+        #expect(UnicodeUtil.columnWidth(character: "a\u{20D1}") == 1)
+    }
+
     /// Test invalid VS15 following emoji that doesn't support it stays wide
     /// From Ghostty: "Terminal: print invalid VS15 following emoji is wide"
     @Test func testInvalidVS15EmojiStaysWide() {
@@ -602,6 +610,397 @@ final class SwiftTermUnicode {
         // The wide character should be replaced
         #expect(t.getCharacter(col: 0, row: 0) == "x")
         #expect(t.getCharData(col: 0, row: 0)?.width == 1)
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharData(col: 1, row: 0)?.width == 1)
+    }
+
+    @Test func testOverwriteWideCharacterFromTrailingCell() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "あ")
+        t.feed(text: "\u{1b}[2Gx")  // Move to the wide character's trailing cell, then overwrite
+
+        #expect(t.getCharacter(col: 0, row: 0) == "x")
+        #expect(t.getCharData(col: 0, row: 0)?.width == 1)
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharData(col: 1, row: 0)?.width == 1)
+        #expect(t.buffer.x == 1)
+    }
+
+    @Test func testBackspaceEraseAfterEmojiVariationSequence() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "\u{2600}\u{FE0F}\u{08} \u{08}")
+
+        // After BS+SP+BS on a wide emoji, the space overwrites the leading cell
+        // and the trailing cell is cleared to null.
+        #expect(t.getCharacter(col: 0, row: 0) == " ")
+        #expect(t.getCharData(col: 0, row: 0)?.width == 1)
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharData(col: 1, row: 0)?.width == 1)
+        #expect(t.buffer.x == 0)
+    }
+
+    @Test func testBackspaceEraseAfterEmojiVariationSequenceAcrossSeparateFeeds() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "\u{2600}\u{FE0F}")
+        t.feed(text: "\u{08}")
+        t.feed(text: " ")
+        t.feed(text: "\u{08}")
+
+        // After BS+SP+BS the wide character is cleared: space at leading cell, null at trailing
+        #expect(t.getCharacter(col: 0, row: 0) == " ")
+        #expect(t.getCharData(col: 0, row: 0)?.width == 1)
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharData(col: 1, row: 0)?.width == 1)
+        #expect(t.buffer.x == 0)
+
+        let bufferLine = t.buffer.lines[t.buffer.y + t.buffer.yBase]
+        guard let resolved = t.resolvedWideCell(in: bufferLine, at: t.buffer.x) else {
+            Issue.record("Expected erased cell to resolve")
+            return
+        }
+        guard let cursor = t.resolvedCursorCell(in: bufferLine, at: t.buffer.x) else {
+            Issue.record("Expected erased cell to resolve to a cursor cell")
+            return
+        }
+
+        #expect(resolved.col == 0)
+        #expect(t.getCharacter(for: resolved.cell) == " ")
+        #expect(resolved.cell.width == 1)
+        #expect(cursor.col == 0)
+        #expect(cursor.renderWidth == 1)
+    }
+
+    @Test func testTypingAfterWideErasePlaceholderOverwritesWholeSlot() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "\u{2600}\u{FE0F}")
+        t.feed(text: "\u{08}")
+        t.feed(text: " ")
+        t.feed(text: "\u{08}")
+        t.feed(text: "a")
+
+        #expect(t.getCharacter(col: 0, row: 0) == "a")
+        #expect(t.getCharData(col: 0, row: 0)?.width == 1)
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharData(col: 1, row: 0)?.width == 1)
+        #expect(t.buffer.x == 1)
+    }
+
+    @Test func testBackspaceEraseAfterWideCharacterAcrossSeparateFeeds() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "あ")
+        t.feed(text: "\u{08}")
+        t.feed(text: " ")
+        t.feed(text: "\u{08}")
+
+        #expect(t.getCharacter(col: 0, row: 0) == " ")
+        #expect(t.getCharData(col: 0, row: 0)?.width == 1)
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharData(col: 1, row: 0)?.width == 1)
+        #expect(t.buffer.x == 0)
+
+        let line = t.buffer.lines[t.buffer.y + t.buffer.yBase]
+        guard let cursor = t.resolvedCursorCell(in: line, at: t.buffer.x) else {
+            Issue.record("Expected erased wide character to resolve to a cursor cell")
+            return
+        }
+
+        #expect(cursor.col == 0)
+        #expect(cursor.renderWidth == 1)
+    }
+
+    @Test func testResolvedWideCellUsesLeaderForTrailingCell() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "\u{2600}\u{FE0F}")
+
+        let line = t.buffer.lines[t.buffer.y + t.buffer.yBase]
+        guard let resolved = t.resolvedWideCell(in: line, at: 1) else {
+            Issue.record("Expected trailing cell to resolve to wide leader")
+            return
+        }
+
+        #expect(resolved.col == 0)
+        #expect(t.getCharacter(for: resolved.cell) == "\u{2600}\u{FE0F}")
+        #expect(resolved.cell.width == 2)
+
+        guard let cursor = t.resolvedCursorCell(in: line, at: 1) else {
+            Issue.record("Expected live wide cell to resolve to a wide cursor span")
+            return
+        }
+
+        #expect(cursor.col == 0)
+        #expect(cursor.renderWidth == 2)
+    }
+
+    @Test func testBackspaceStepsOverVs16WideGlyphAsSingleUnit() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "a\u{2600}\u{FE0F}")
+        #expect(t.buffer.x == 3)
+
+        t.feed(text: "\u{08}")
+
+        #expect(t.buffer.x == 1)
+    }
+
+    @Test func testCursorBackwardStepsOverVs16WideGlyphAsSingleUnit() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "a\u{2600}\u{FE0F}")
+        #expect(t.buffer.x == 3)
+
+        t.feed(text: "\u{1b}[1D")
+
+        #expect(t.buffer.x == 1)
+    }
+
+    @Test func testCursorForwardStepsOverVs16WideGlyphAsSingleUnit() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "a\u{2600}\u{FE0F}")
+        t.feed(text: "\u{1b}[1D")
+        #expect(t.buffer.x == 1)
+
+        t.feed(text: "\u{1b}[1C")
+
+        #expect(t.buffer.x == 3)
+    }
+
+    @Test func testBackspaceKeepsCellwiseMovementForCjkWideGlyph() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "aあ")
+        #expect(t.buffer.x == 3)
+
+        t.feed(text: "\u{08}")
+
+        #expect(t.buffer.x == 2)
+    }
+
+    @Test func testZshStyleRedrawAfterVs16EmojiDeleteDoesNotDuplicatePrefix() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "a\u{2600}\u{FE0F}")
+        let redraw: [UInt8] = [0x08, 0x08, 0x1b, 0x5b, 0x32, 0x37, 0x6d, 0x61, 0x1b, 0x5b, 0x32, 0x37, 0x6d, 0x20, 0x08]
+        t.feed(buffer: redraw[...])
+
+        #expect(t.getCharacter(col: 0, row: 0) == "a")
+        #expect(t.getCharacter(col: 1, row: 0) == " ")
+        #expect(t.getCharData(col: 2, row: 0)?.code == 0)
+        #expect(t.buffer.x == 1)
+    }
+
+    @Test func testZshStyleRedrawAfterVs16EmojiDeleteWithTwoAsciiPrefixes() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "aa\u{2600}\u{FE0F}")
+        let redraw: [UInt8] = [0x08, 0x1b, 0x5b, 0x32, 0x37, 0x6d, 0x1b, 0x5b, 0x32, 0x37, 0x6d, 0x20, 0x08]
+        t.feed(buffer: redraw[...])
+
+        #expect(t.getCharacter(col: 0, row: 0) == "a")
+        #expect(t.getCharacter(col: 1, row: 0) == "a")
+        #expect(t.getCharacter(col: 2, row: 0) == " ")
+        #expect(t.buffer.x == 2)
+    }
+
+    @Test func testZshStyleRedrawAfterMidLineVs16DeleteCollapsesSuffix() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "aaa\u{2600}\u{FE0F}aaa")
+        t.feed(text: "\u{1b}[D\u{1b}[D\u{1b}[D")
+        #expect(t.buffer.x == 5)
+
+        let redraw: [UInt8] = [0x08, 0x61, 0x1b, 0x5b, 0x32, 0x43, 0x20, 0x08, 0x08, 0x08, 0x08]
+        t.feed(buffer: redraw[...])
+
+        #expect(t.getCharacter(col: 0, row: 0) == "a")
+        #expect(t.getCharacter(col: 1, row: 0) == "a")
+        #expect(t.getCharacter(col: 2, row: 0) == "a")
+        #expect(t.getCharacter(col: 3, row: 0) == "a")
+        #expect(t.getCharacter(col: 4, row: 0) == "a")
+        #expect(t.getCharacter(col: 5, row: 0) == "a")
+        #expect(t.getCharacter(col: 6, row: 0) == " ")
+        #expect(t.buffer.x == 3)
+    }
+
+    @Test func testZshStyleSecondBackspaceAfterMidLineVs16DeleteKeepsSuffixCollapsed() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "aaa\u{2600}\u{FE0F}aaa")
+        t.feed(text: "\u{1b}[D\u{1b}[D\u{1b}[D")
+        let firstDelete: [UInt8] = [0x08, 0x61, 0x1b, 0x5b, 0x32, 0x43, 0x20, 0x08, 0x08, 0x08, 0x08]
+        t.feed(buffer: firstDelete[...])
+
+        let secondDelete: [UInt8] = [0x1b, 0x5b, 0x32, 0x43, 0x20, 0x08, 0x08, 0x08, 0x08]
+        t.feed(buffer: secondDelete[...])
+
+        #expect(t.getCharacter(col: 0, row: 0) == "a")
+        #expect(t.getCharacter(col: 1, row: 0) == "a")
+        #expect(t.getCharacter(col: 2, row: 0) == "a")
+        #expect(t.getCharacter(col: 3, row: 0) == "a")
+        #expect(t.getCharacter(col: 4, row: 0) == "a")
+        #expect(t.getCharacter(col: 5, row: 0) == " ")
+        #expect(t.buffer.x == 2)
+    }
+
+    @Test func testZshStyleRedrawAfterAsciiDeleteBeforeVs16AndCjkSuffixKeepsCursorAligned() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "aiueo\u{2600}\u{FE0F}あいうえお")
+        t.feed(text: "\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D")
+        #expect(t.buffer.x == 5)
+
+        let redraw: [UInt8] = [0x08, 0x1b, 0x5b, 0x50, 0x1b, 0x5b, 0x31, 0x31, 0x43, 0x20, 0x1b, 0x5b, 0x31, 0x32, 0x44]
+        t.feed(buffer: redraw[...])
+
+        #expect(t.getCharacter(col: 0, row: 0) == "a")
+        #expect(t.getCharacter(col: 1, row: 0) == "i")
+        #expect(t.getCharacter(col: 2, row: 0) == "u")
+        #expect(t.getCharacter(col: 3, row: 0) == "e")
+        #expect(t.getCharacter(col: 4, row: 0) == "\u{2600}\u{FE0F}")
+        #expect(t.getCharacter(col: 6, row: 0) == "あ")
+        #expect(t.getCharacter(col: 8, row: 0) == "い")
+        #expect(t.getCharacter(col: 10, row: 0) == "う")
+        #expect(t.getCharacter(col: 12, row: 0) == "え")
+        #expect(t.getCharacter(col: 14, row: 0) == "お")
+        #expect(t.buffer.x == 4)
+    }
+
+    @Test func testVs16RewriteAfterLineStartInsertKeepsAsciiPrefixVisible() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "aiueo")
+        t.feed(text: "\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D")
+
+        let initialInsert: [UInt8] = [
+            0x1b, 0x5b, 0x37, 0x6d,
+            0xE2, 0x98, 0x80, 0xEF, 0xB8, 0x8F,
+            0x1b, 0x5b, 0x32, 0x37, 0x6d,
+            0x61, 0x69, 0x75, 0x65, 0x6f,
+            0x08, 0x08, 0x08, 0x08, 0x08
+        ]
+        t.feed(buffer: initialInsert[...])
+
+        #expect(t.getText(start: Position(col: 0, row: 0), end: Position(col: 12, row: 0)) == "☀️aiueo")
+        #expect(t.buffer.x == 2)
+
+        let rightArrowRedraw: [UInt8] = [
+            0x08,
+            0x1b, 0x5b, 0x32, 0x37, 0x6d,
+            0xE2, 0x98, 0x80, 0xEF, 0xB8, 0x8F,
+            0x1b, 0x5b, 0x31, 0x43
+        ]
+        t.feed(buffer: rightArrowRedraw[...])
+
+        #expect(t.getText(start: Position(col: 0, row: 0), end: Position(col: 12, row: 0)) == "☀️aiueo")
+        #expect(t.buffer.x == 3)
+    }
+
+    @Test func testImeVs16RewriteAfterLineStartInsertKeepsAsciiPrefixVisible() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "aiueo")
+        t.feed(text: "\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D")
+
+        let imeChunk1: [UInt8] = [
+            0xE2, 0x98, 0x80,
+            0x61, 0x69, 0x75, 0x65, 0x6F,
+            0x08, 0x08, 0x08, 0x08, 0x08
+        ]
+        t.feed(buffer: imeChunk1[...])
+
+        #expect(t.getText(start: Position(col: 0, row: 0), end: Position(col: 12, row: 0)) == "☀aiueo")
+        #expect(t.buffer.x == 1)
+
+        let imeChunk2: [UInt8] = [0x08, 0xE2, 0x98, 0x80, 0xEF, 0xB8, 0x8F]
+        t.feed(buffer: imeChunk2[...])
+
+        #expect(t.getText(start: Position(col: 0, row: 0), end: Position(col: 12, row: 0)) == "☀️aiueo")
+        #expect(t.buffer.x == 2)
+    }
+
+    @Test func testCtrlKStyleEraseFromLineStartClearsVs16AndAsciiSuffix() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "\u{2600}\u{FE0F}aiueo")
+        t.feed(text: "\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D")
+        t.feed(buffer: [0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08][...])
+
+        #expect(t.getCharacter(col: 0, row: 0) == " ")
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharacter(col: 2, row: 0) == " ")
+        #expect(t.getCharacter(col: 3, row: 0) == " ")
+        #expect(t.getCharacter(col: 4, row: 0) == " ")
+        #expect(t.getCharacter(col: 5, row: 0) == " ")
+        #expect(t.getCharacter(col: 6, row: 0) == " ")
+        #expect(t.buffer.x == 0)
+    }
+
+    @Test func testTypingAfterCtrlKStyleEraseDoesNotRevealStaleSuffix() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "\u{2600}\u{FE0F}aiueo")
+        t.feed(text: "\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D\u{1b}[D")
+        t.feed(buffer: [0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08][...])
+        t.feed(text: "x")
+
+        #expect(t.getCharacter(col: 0, row: 0) == "x")
+        #expect(t.getCharData(col: 1, row: 0)?.code == 0)
+        #expect(t.getCharacter(col: 2, row: 0) == " ")
+        #expect(t.getCharacter(col: 6, row: 0) == " ")
+        #expect(t.buffer.x == 1)
+    }
+
+    @Test func testDeleteVs16BetweenCjkRunsKeepsSuffixAligned() {
+        let h = HeadlessTerminal(queue: SwiftTermTests.queue) { _ in }
+        let t = h.terminal!
+
+        t.feed(text: "あいうえお")
+        t.feed(buffer: [0xE2, 0x98, 0x80][...])
+        t.feed(buffer: [0x08, 0xE2, 0x98, 0x80, 0xEF, 0xB8, 0x8F][...])
+        t.feed(text: "あいうえお")
+        for _ in 0..<5 {
+            t.feed(buffer: [0x08, 0x08][...])
+        }
+
+        let redraw: [UInt8] = [0x08, 0x1b, 0x5b, 0x50, 0x1b, 0x5b, 0x31, 0x30, 0x43, 0x20, 0x1b, 0x5b, 0x31, 0x31, 0x44]
+        t.feed(buffer: redraw[...])
+
+        #expect(t.getCharacter(col: 0, row: 0) == "あ")
+        #expect(t.getCharacter(col: 2, row: 0) == "い")
+        #expect(t.getCharacter(col: 4, row: 0) == "う")
+        #expect(t.getCharacter(col: 6, row: 0) == "え")
+        #expect(t.getCharacter(col: 8, row: 0) == "お")
+        #expect(t.getCharacter(col: 10, row: 0) == "あ")
+        #expect(t.getCharacter(col: 12, row: 0) == "い")
+        #expect(t.getCharacter(col: 14, row: 0) == "う")
+        #expect(t.getCharacter(col: 16, row: 0) == "え")
+        #expect(t.getCharacter(col: 18, row: 0) == "お")
+        #expect(t.buffer.x == 10)
     }
 
     /// Test wide character at end of line wraps correctly

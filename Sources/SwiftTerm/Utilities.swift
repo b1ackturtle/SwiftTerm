@@ -377,4 +377,33 @@ struct UnicodeUtil {
 
         return 1
     }
+
+    static func columnWidth(character: Character) -> Int
+    {
+        let scalars = Array(character.unicodeScalars)
+        guard let firstScalar = scalars.first else {
+            return 0
+        }
+        if scalars.count == 1 {
+            return columnWidth(rune: firstScalar)
+        }
+
+        var width = 0
+        var hasVs16EmojiPresentation = false
+        for (index, scalar) in scalars.enumerated() {
+            let scalarWidth = columnWidth(rune: scalar)
+            if scalarWidth < 0 {
+                return -1
+            }
+            width = max(width, scalarWidth)
+
+            if scalar.value == 0xFE0F, index > 0, isEmojiVs16Base(rune: scalars[index - 1]) {
+                hasVs16EmojiPresentation = true
+            }
+        }
+        if hasVs16EmojiPresentation {
+            width = max(width, 2)
+        }
+        return width
+    }
 }

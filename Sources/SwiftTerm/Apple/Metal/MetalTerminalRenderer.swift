@@ -2071,11 +2071,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let lineOriginPx = CGPoint(x: lineOrigin.x * scale, y: lineOrigin.y * scale)
         let cellWidthPx = cellWidth * scale
         let cellHeightPx = cellHeight * scale
-        let doublePosition: CGFloat = buffer.lines[cursorRow].renderMode == .single ? 1.0 : 2.0
+        let cursorLine = buffer.lines[cursorRow]
+        let doublePosition: CGFloat = cursorLine.renderMode == .single ? 1.0 : 2.0
+        guard let resolvedCursor = terminalView.resolvedCursorCell(in: cursorLine, at: buffer.x) else {
+            return ([], [], [])
+        }
 
-        let cursorCharData = buffer.lines[cursorRow][buffer.x]
-        let cursorCharWidth = CGFloat(max(1, Int(cursorCharData.width)))
-        let x0 = lineOriginPx.x + CGFloat(buffer.x) * cellWidthPx * doublePosition
+        let cursorCharWidth = CGFloat(resolvedCursor.renderWidth)
+        let x0 = lineOriginPx.x + CGFloat(resolvedCursor.col) * cellWidthPx * doublePosition
         let y0 = lineOriginPx.y
         let x1 = x0 + cellWidthPx * cursorCharWidth
         let y1 = y0 + cellHeightPx
@@ -2141,19 +2144,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                                           color: cursorColor))
         }
 
-        let charData = buffer.lines[cursorRow][buffer.x]
+        let charData = resolvedCursor.cell
         let caretTextColor = terminalView.caretTextColor ?? terminalView.nativeForegroundColor
         let attributes = terminalView.getAttributedValue(charData.attribute,
                                                          usingFg: terminalView.caretColor,
                                                          andBg: caretTextColor) ?? [.font: terminalView.fontSet.normal]
-        let attributedString = NSAttributedString(string: String(charData.getCharacter()), attributes: attributes)
+        let attributedString = NSAttributedString(string: String(terminalView.terminal.getCharacter(for: charData)), attributes: attributes)
         let ctline = CTLineCreateWithAttributedString(attributedString)
         guard let runs = CTLineGetGlyphRuns(ctline) as? [CTRun] else {
             return (colorVertices, [], [])
         }
         let yOffset = ceil(lineDescent + lineLeading)
         let textColorSIMD = colorToSIMD(caretTextColor)
-        let baseX = lineOrigin.x + cellWidth * doublePosition * CGFloat(buffer.x)
+        let baseX = lineOrigin.x + cellWidth * doublePosition * CGFloat(resolvedCursor.col)
 
         for run in runs {
             let runGlyphsCount = CTRunGetGlyphCount(run)

@@ -102,6 +102,14 @@ public class PseudoTerminalHelpers {
             if let cCurrentDirectory {
                 _ = chdir(cCurrentDirectory)
             }
+
+#if os(macOS)
+            var tty = termios()
+            if tcgetattr(STDIN_FILENO, &tty) == 0 {
+                tty.c_iflag |= tcflag_t(IUTF8)
+                _ = tcsetattr(STDIN_FILENO, TCSANOW, &tty)
+            }
+#endif
             
             _ = execve(cExecutable, cArgs.base, cEnv.base)
             _exit(127)

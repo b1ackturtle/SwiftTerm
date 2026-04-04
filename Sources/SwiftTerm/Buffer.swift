@@ -1134,6 +1134,7 @@ public final class Buffer {
         let right = marginMode ? _marginRight : _cols - 1
         var consumed = 0
         var idx = bytes.startIndex
+        var lastWrittenColumn: Int? = nil
 
         while idx < bytes.endIndex {
             if _x > right {
@@ -1146,18 +1147,41 @@ public final class Buffer {
                     _lines[_y].isWrapped = true
                 }
             }
-            let available = right - _x + 1
-            let runLen = min(available, bytes.endIndex - idx)
             let row = _lines[_y + _yBase]
-            for i in 0..<runLen {
-                row[_x + i] = CharData(attribute: attribute, code: Int32(bytes[idx + i]), size: 1)
+            let writeCol = _x
+
+            _x = leadingColumnForWideCharacterWrite(in: row, at: writeCol)
+            if bytes[idx] == 0x20,
+               let overwrittenVs16Range = liveVs16WideRange(in: row, at: _x),
+               overwrittenVs16Range.count > 1
+            {
+                clearWideCharacterOverlap(in: row, startCol: _x, width: 1)
+                row[_x] = CharData(attribute: attribute, code: 0x20, size: 1)
+                let followerCol = _x + 1
+                if followerCol < _cols {
+                    var follower = CharData.Null
+                    follower.attribute = attribute
+                    follower.isVs16WideFollower = true
+                    row[followerCol] = follower
+                }
+                lastWrittenColumn = _x
+                _x = min(_cols, overwrittenVs16Range.upperBound)
+                consumed += 1
+                idx += 1
+                continue
             }
-            _x += runLen
-            consumed += runLen
-            idx += runLen
+            let overwrittenVs16Range = bytes[idx] == 0x20 ? nil : liveVs16WideRange(in: row, at: _x)
+            clearWideCharacterOverlap(in: row, startCol: _x, width: 1)
+            row[_x] = CharData(attribute: attribute, code: Int32(bytes[idx]), size: 1)
+            lastWrittenColumn = _x
+            _x += 1
+            collapseVs16OverwriteIfNeeded(in: row, overwrittenRange: overwrittenVs16Range, rightMargin: right, fillAttribute: attribute)
+
+            consumed += 1
+            idx += 1
         }
-        if consumed > 0 {
-            lastBufferStorage = (_y + _yBase, _x - 1, _cols, _rows)
+        if let lastWrittenColumn {
+            lastBufferStorage = (_y + _yBase, lastWrittenColumn, _cols, _rows)
         }
         return consumed
     }
@@ -1197,6 +1221,15 @@ public final class Buffer {
             }
         }
         let bufferRow = _lines[_y+_yBase]
+        if _x >= _cols {
+            _x = _cols-1
+        }
+
+        _x = leadingColumnForWideCharacterWrite(in: bufferRow, at: _x)
+        let overwrittenVs16Range = (!insertMode && chWidth == 1 && charData.code != 32) ? liveVs16WideRange(in: bufferRow, at: _x) : nil
+        if !insertMode {
+            clearWideCharacterOverlap(in: bufferRow, startCol: _x, width: chWidth)
+        }
 
         // insert mode: move characters to right
         if insertMode {
@@ -1215,11 +1248,9 @@ public final class Buffer {
 
         // write current char to buffer and advance cursor
         lastBufferStorage = (_y + _yBase, _x, _cols, _rows)
-        if _x >= _cols {
-            _x = _cols-1
-        }
         bufferRow[_x] = charData
         _x += 1
+        collapseVs16OverwriteIfNeeded(in: bufferRow, overwrittenRange: overwrittenVs16Range, rightMargin: right, fillAttribute: charData.attribute)
 
         // fullwidth char - also set next cell to placeholder stub and advance cursor
         // for graphemes bigger than fullwidth we can simply loop to zero
@@ -1235,6 +1266,132 @@ public final class Buffer {
         }
         
     }
+
+    func expandNarrowCharacterToWide(_ charData: CharData, fillAttribute: Attribute) {
+        guard charData.width > 1 else {
+            insertCharacter(charData)
+            return
+        }
+
+        let right = marginMode ? _marginRight : _cols - 1
+        let bufferRow = _lines[_y + _yBase]
+        var empty = CharData.Null
+        empty.attribute = fillAttribute
+
+        bufferRow.insertCells(pos: _x + 1, n: 1, rightMargin: right, fillData: empty)
+        if right >= 0 {
+            let lastCell = bufferRow[right]
+            if lastCell.width > 1 || (lastCell.code == 0 && right > 0 && bufferRow[right - 1].width > 1) {
+                bufferRow[right] = empty
+            }
+        }
+
+        lastBufferStorage = (_y + _yBase, _x, _cols, _rows)
+        bufferRow[_x] = charData
+        _x += 1
+
+        var follower = CharData(attribute: charData.attribute, scalar: UnicodeScalar(0)!, size: 0)
+        follower.isVs16WideFollower = true
+        if _x < _cols {
+            bufferRow[_x] = follower
+            _x += 1
+        }
+    }
+
+    private func leadingColumnForWideCharacterWrite(in row: BufferLine, at col: Int) -> Int {
+        guard let occupied = wideCharacterRange(in: row, at: col) else {
+            return col
+        }
+        return occupied.lowerBound
+    }
+
+    private func liveVs16WideRange(in row: BufferLine, at col: Int) -> Range<Int>? {
+        guard let occupied = wideCharacterRange(in: row, at: col),
+              occupied.count > 1
+        else {
+            return nil
+        }
+
+        let follower = occupied.lowerBound + 1
+        guard follower < occupied.upperBound,
+              row[follower].isVs16WideFollower
+        else {
+            return nil
+        }
+
+        return occupied
+    }
+
+    private func wideCharacterRange(in row: BufferLine, at col: Int) -> Range<Int>? {
+        guard col >= 0 && col < _cols else {
+            return nil
+        }
+        let cell = row[col]
+        if cell.width > 1 {
+            return col..<min(_cols, col + Int(cell.width))
+        }
+        if cell.code == 0 && col > 0 {
+            let previous = row[col - 1]
+            if previous.width > 1 {
+                let start = col - 1
+                return start..<min(_cols, start + Int(previous.width))
+            }
+        }
+        return nil
+    }
+
+    private func clearWideCharacterOverlap(in row: BufferLine, startCol: Int, width: Int) {
+        guard _cols > 0 else {
+            return
+        }
+
+        var clearStart = max(0, min(startCol, _cols - 1))
+        var clearEnd = min(_cols, clearStart + max(1, width))
+        var foundWideCharacter = false
+        var expanded = true
+
+        while expanded {
+            expanded = false
+            var col = clearStart
+            while col < clearEnd {
+                if let occupied = wideCharacterRange(in: row, at: col) {
+                    foundWideCharacter = true
+                    if occupied.lowerBound < clearStart {
+                        clearStart = occupied.lowerBound
+                        expanded = true
+                    }
+                    if occupied.upperBound > clearEnd {
+                        clearEnd = occupied.upperBound
+                        expanded = true
+                    }
+                    col = occupied.upperBound
+                } else {
+                    col += 1
+                }
+            }
+        }
+
+        guard foundWideCharacter else {
+            return
+        }
+
+        var empty = CharData.Null
+        empty.attribute = curAttr
+        row.replaceCells(start: clearStart, end: clearEnd, fillData: empty)
+    }
+
+    private func collapseVs16OverwriteIfNeeded(in row: BufferLine, overwrittenRange: Range<Int>?, rightMargin: Int, fillAttribute: Attribute) {
+        guard let overwrittenRange,
+              overwrittenRange.count > 1
+        else {
+            return
+        }
+
+        var empty = CharData.Null
+        empty.attribute = fillAttribute
+        row.deleteCells(pos: overwrittenRange.lowerBound + 1, n: overwrittenRange.count - 1, rightMargin: rightMargin, fillData: empty)
+    }
+
     
     func dumpConsole ()
     {
